@@ -4,3 +4,6 @@ TempMonitor
 *.dmg
 *.o
 *.dSYM/
+
+# macOS
+.DS_Store
