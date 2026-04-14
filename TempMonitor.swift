@@ -399,3 +399,66 @@ final class MenuBarController {
         return "Unknown"
     }
 }
+
+// MARK: - AppDelegate
+
+/// Application delegate. Owns the SMC reader and menu bar controller.
+/// Sets up a 3-second repeating timer to refresh temperature readings.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var reader: TemperatureReader?
+    private var menuBar: MenuBarController?
+    private var refreshTimer: Timer?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let smc = SMCClient()
+        guard smc.open() else {
+            let mb = MenuBarController()
+            mb.showError("⚠ SMC Error")
+            menuBar = mb
+            NSLog("TempMonitor: Failed to open SMC connection")
+            return
+        }
+
+        let tempReader = TemperatureReader(smc: smc)
+        reader = tempReader
+
+        let mb = MenuBarController()
+        menuBar = mb
+
+        // Initial reading
+        refreshTemperatures()
+
+        // Schedule repeating timer — weak self to prevent retain cycle
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+            self?.refreshTemperatures()
+        }
+        // Ensure timer fires during UI tracking (e.g., when menu is open)
+        if let timer = refreshTimer {
+            RunLoop.current.add(timer, forMode: .common)
+        }
+
+        NSLog("TempMonitor: Started — CPU key: %@, Battery key: %@",
+              tempReader.cpuKey ?? "none",
+              tempReader.batteryKey ?? "none")
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        refreshTimer?.invalidate()
+        refreshTimer = nil
+        // reader and its SMCClient will be deallocated, closing the IOKit connection via deinit
+    }
+
+    private func refreshTemperatures() {
+        guard let reader = reader, let menuBar = menuBar else { return }
+        let cpuTemp = reader.readCPUTemp()
+        let batteryTemp = reader.readBatteryTemp()
+        menuBar.update(cpuTemp: cpuTemp, batteryTemp: batteryTemp)
+    }
+}
+
+// MARK: - Main Entry Point
+
+let app = NSApplication.shared
+let delegate = AppDelegate()
+app.delegate = delegate
+app.run()
