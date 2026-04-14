@@ -1,0 +1,45 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build app and DMG
+        run: ./build.sh
+
+      - name: Verify build
+        run: |
+          file build/TempMonitor.app/Contents/MacOS/TempMonitor
+          codesign --verify build/TempMonitor.app
+          ls -lh build/TempMonitor.dmg
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/TempMonitor.dmg
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            1. Download `TempMonitor.dmg` below
+            2. Open the DMG
+            3. Drag `TempMonitor.app` to your Applications folder
+            4. Launch TempMonitor — it appears in your menubar
+
+            ## What's in the menubar
+
+            ```
+            CPU: 48°C 2.1GHz | Bat: 31°C
+            ```
+
+            **Requirements:** macOS 14+, Apple Silicon (M1/M2/M3/M4)
