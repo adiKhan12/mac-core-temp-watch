@@ -302,6 +302,224 @@ final class TemperatureReader {
     }
 }
 
+// MARK: - IOReport Frequency Reading
+
+/// Function type aliases for dynamically-loaded IOReport functions.
+private typealias IORCopyChannelsInGroupFn = @convention(c) (CFString?, CFString?, UInt64, UInt64, UInt64) -> Unmanaged<CFDictionary>?
+private typealias IORCreateSubscriptionFn = @convention(c) (UnsafeMutableRawPointer?, CFMutableDictionary, UnsafeMutablePointer<Unmanaged<CFMutableDictionary>?>, UInt64, CFTypeRef?) -> Unmanaged<CFTypeRef>?
+private typealias IORCreateSamplesFn = @convention(c) (CFTypeRef, CFMutableDictionary, CFTypeRef?) -> Unmanaged<CFDictionary>?
+private typealias IORCreateSamplesDeltaFn = @convention(c) (CFDictionary, CFDictionary, CFTypeRef?) -> Unmanaged<CFDictionary>?
+private typealias IORChannelGetNameFn = @convention(c) (CFDictionary) -> Unmanaged<CFString>?
+private typealias IORStateGetCountFn = @convention(c) (CFDictionary) -> Int32
+private typealias IORStateGetResidencyFn = @convention(c) (CFDictionary, Int32) -> Int64
+private typealias IORStateGetNameForIndexFn = @convention(c) (CFDictionary, Int32) -> Unmanaged<CFString>?
+
+/// Reads real-time per-cluster CPU frequency via IOReport DVFS residency sampling.
+/// Dynamically loads the private IOReport framework. No root/sudo required.
+final class FrequencyReader {
+    struct ClusterFrequency {
+        var pClusterMHz: Double?
+        var eClusterMHz: Double?
+
+        var pClusterGHz: String { pClusterMHz.map { String(format: "%.1f", $0 / 1000.0) } ?? "--" }
+        var eClusterGHz: String { eClusterMHz.map { String(format: "%.1f", $0 / 1000.0) } ?? "--" }
+    }
+
+    // IOReport dylib handle and function pointers
+    private let handle: UnsafeMutableRawPointer
+    private let copyChannelsInGroup: IORCopyChannelsInGroupFn
+    private let createSubscription: IORCreateSubscriptionFn
+    private let createSamples: IORCreateSamplesFn
+    private let createSamplesDelta: IORCreateSamplesDeltaFn
+    private let channelGetName: IORChannelGetNameFn
+    private let stateGetCount: IORStateGetCountFn
+    private let stateGetResidency: IORStateGetResidencyFn
+    private let stateGetNameForIndex: IORStateGetNameForIndexFn
+
+    // IOReport subscription state
+    private let subscription: CFTypeRef
+    private let subscribedChannels: CFMutableDictionary
+    private var previousSample: CFDictionary?
+
+    // DVFS frequency tables (Hz values from IORegistry)
+    private let pClusterFreqs: [UInt32]  // P-cluster DVFS levels
+    private let eClusterFreqs: [UInt32]  // E-cluster DVFS levels
+
+    init?() {
+        // Load IOReport dylib
+        guard let h = dlopen("/usr/lib/libIOReport.dylib", RTLD_NOW) else {
+            NSLog("FrequencyReader: Failed to load IOReport")
+            return nil
+        }
+        handle = h
+
+        func loadSym<T>(_ name: String) -> T? {
+            guard let sym = dlsym(h, name) else { return nil }
+            return unsafeBitCast(sym, to: T.self)
+        }
+
+        guard let fn1: IORCopyChannelsInGroupFn = loadSym("IOReportCopyChannelsInGroup"),
+              let fn2: IORCreateSubscriptionFn = loadSym("IOReportCreateSubscription"),
+              let fn3: IORCreateSamplesFn = loadSym("IOReportCreateSamples"),
+              let fn4: IORCreateSamplesDeltaFn = loadSym("IOReportCreateSamplesDelta"),
+              let fn5: IORChannelGetNameFn = loadSym("IOReportChannelGetChannelName"),
+              let fn6: IORStateGetCountFn = loadSym("IOReportStateGetCount"),
+              let fn7: IORStateGetResidencyFn = loadSym("IOReportStateGetResidency"),
+              let fn8: IORStateGetNameForIndexFn = loadSym("IOReportStateGetNameForIndex")
+        else {
+            NSLog("FrequencyReader: Failed to load IOReport symbols")
+            dlclose(h)
+            return nil
+        }
+
+        copyChannelsInGroup = fn1; createSubscription = fn2
+        createSamples = fn3; createSamplesDelta = fn4
+        channelGetName = fn5; stateGetCount = fn6
+        stateGetResidency = fn7; stateGetNameForIndex = fn8
+
+        // Read DVFS frequency tables from IORegistry
+        pClusterFreqs = FrequencyReader.readDVFSTable("voltage-states5-sram")
+        eClusterFreqs = FrequencyReader.readDVFSTable("voltage-states1-sram")
+
+        // Subscribe to CPU Core Performance States
+        guard let channels = fn1("CPU Stats" as CFString, "CPU Core Performance States" as CFString, 0, 0, 0)?.takeRetainedValue() else {
+            NSLog("FrequencyReader: Failed to get CPU channels")
+            dlclose(h)
+            return nil
+        }
+
+        let channelsMut = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, channels)!
+        var subChPtr: Unmanaged<CFMutableDictionary>?
+        guard let sub = fn2(nil, channelsMut, &subChPtr, 0, nil)?.takeRetainedValue() else {
+            NSLog("FrequencyReader: Failed to create subscription")
+            dlclose(h)
+            return nil
+        }
+        guard let subCh = subChPtr?.takeRetainedValue() else {
+            NSLog("FrequencyReader: No subscribed channels")
+            dlclose(h)
+            return nil
+        }
+
+        subscription = sub
+        subscribedChannels = subCh
+        previousSample = nil
+
+        NSLog("FrequencyReader: Ready — P-levels: %d, E-levels: %d",
+              pClusterFreqs.count, eClusterFreqs.count)
+    }
+
+    deinit {
+        previousSample = nil
+        dlclose(handle)
+    }
+
+    /// Take a sample and compute cluster frequencies from the delta against the previous sample.
+    /// Returns nil for a cluster if no cores were active or on first call (no previous sample yet).
+    func sample() -> ClusterFrequency {
+        guard let currentSample = createSamples(subscription, subscribedChannels, nil)?.takeRetainedValue() else {
+            return ClusterFrequency()
+        }
+
+        defer { previousSample = currentSample }
+
+        guard let prev = previousSample else {
+            // First call — no delta yet, just store the sample
+            return ClusterFrequency()
+        }
+
+        guard let delta = createSamplesDelta(prev, currentSample, nil)?.takeRetainedValue() else {
+            return ClusterFrequency()
+        }
+
+        return parseFrequencies(from: delta)
+    }
+
+    // MARK: - Private
+
+    private func parseFrequencies(from delta: CFDictionary) -> ClusterFrequency {
+        let key = Unmanaged.passUnretained("IOReportChannels" as CFString).toOpaque()
+        guard let arrPtr = CFDictionaryGetValue(delta, key) else { return ClusterFrequency() }
+        let arr = Unmanaged<CFArray>.fromOpaque(arrPtr).takeUnretainedValue()
+
+        var pFreqSum = 0.0, pCores = 0
+        var eFreqSum = 0.0, eCores = 0
+
+        for i in 0..<CFArrayGetCount(arr) {
+            guard let itemPtr = CFArrayGetValueAtIndex(arr, i) else { continue }
+            let item = Unmanaged<CFDictionary>.fromOpaque(itemPtr).takeUnretainedValue()
+
+            guard let name = channelGetName(item)?.takeUnretainedValue() as String? else { continue }
+            let isPCPU = name.contains("PCPU")
+            let isECPU = name.contains("ECPU")
+            guard isPCPU || isECPU else { continue }
+
+            let freqTable = isPCPU ? pClusterFreqs : eClusterFreqs
+            let sc = Int(stateGetCount(item))
+
+            var coreWeighted = 0.0, coreNs: Int64 = 0
+            for s in 0..<sc {
+                let sn = (stateGetNameForIndex(item, Int32(s))?.takeUnretainedValue() as String?) ?? ""
+                if sn == "IDLE" || sn == "DOWN" || sn == "OFF" { continue }
+                let ns = stateGetResidency(item, Int32(s))
+                guard ns > 0 else { continue }
+                if let idx = FrequencyReader.parseDVFSIndex(from: sn), idx < freqTable.count {
+                    let mhz = Double(freqTable[idx]) / 1_000_000.0
+                    coreWeighted += Double(ns) * mhz
+                    coreNs += ns
+                }
+            }
+
+            if coreNs > 0 {
+                let avgMHz = coreWeighted / Double(coreNs)
+                if isPCPU { pFreqSum += avgMHz; pCores += 1 }
+                else { eFreqSum += avgMHz; eCores += 1 }
+            }
+        }
+
+        return ClusterFrequency(
+            pClusterMHz: pCores > 0 ? pFreqSum / Double(pCores) : nil,
+            eClusterMHz: eCores > 0 ? eFreqSum / Double(eCores) : nil
+        )
+    }
+
+    /// Parse the DVFS table index from a state name like "V0P19" → 19.
+    private static func parseDVFSIndex(from name: String) -> Int? {
+        // Find the last sequence of digits in the name
+        var end = name.endIndex
+        while end > name.startIndex && !name[name.index(before: end)].isNumber { end = name.index(before: end) }
+        guard end > name.startIndex else { return nil }
+        var start = end
+        while start > name.startIndex && name[name.index(before: start)].isNumber { start = name.index(before: start) }
+        return Int(name[start..<end])
+    }
+
+    /// Read DVFS frequency table from IORegistry for a given property name.
+    /// Searches all AppleARMIODevice services for the property.
+    private static func readDVFSTable(_ property: String) -> [UInt32] {
+        let matching = IOServiceMatching("AppleARMIODevice")
+        var iterator: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == kIOReturnSuccess else { return [] }
+        defer { IOObjectRelease(iterator) }
+
+        var service = IOIteratorNext(iterator)
+        while service != IO_OBJECT_NULL {
+            defer { IOObjectRelease(service); service = IOIteratorNext(iterator) }
+            guard let ref = IORegistryEntryCreateCFProperty(service, property as CFString, kCFAllocatorDefault, 0) else { continue }
+            guard let data = ref.takeRetainedValue() as? Data, data.count >= 8 else { continue }
+
+            var freqs: [UInt32] = []
+            for i in stride(from: 0, to: data.count, by: 8) {
+                guard i + 4 <= data.count else { break }
+                let freq = data.subdata(in: i..<i+4).withUnsafeBytes { $0.load(as: UInt32.self) }
+                if freq > 0 { freqs.append(freq) }
+            }
+            return freqs
+        }
+        return []
+    }
+}
+
 // MARK: - MenuBarController
 
 /// Manages the NSStatusItem in the menu bar and its dropdown menu.
@@ -311,6 +529,8 @@ final class MenuBarController {
 
     // Menu item references for updating text
     private let cpuMenuItem: NSMenuItem
+    private let pFreqMenuItem: NSMenuItem
+    private let eFreqMenuItem: NSMenuItem
     private let batteryMenuItem: NSMenuItem
     private let statusMenuItem: NSMenuItem
 
@@ -321,6 +541,14 @@ final class MenuBarController {
         cpuMenuItem = NSMenuItem(title: "CPU Temperature:  --", action: nil, keyEquivalent: "")
         cpuMenuItem.isEnabled = false
         menu.addItem(cpuMenuItem)
+
+        pFreqMenuItem = NSMenuItem(title: "P-Cluster Frequency:  --", action: nil, keyEquivalent: "")
+        pFreqMenuItem.isEnabled = false
+        menu.addItem(pFreqMenuItem)
+
+        eFreqMenuItem = NSMenuItem(title: "E-Cluster Frequency:  --", action: nil, keyEquivalent: "")
+        eFreqMenuItem.isEnabled = false
+        menu.addItem(eFreqMenuItem)
 
         batteryMenuItem = NSMenuItem(title: "Battery Temperature:  --", action: nil, keyEquivalent: "")
         batteryMenuItem.isEnabled = false
@@ -340,18 +568,16 @@ final class MenuBarController {
         statusItem.menu = menu
     }
 
-    /// Update the menubar title and dropdown with current temperatures.
-    /// Pass nil for a sensor that is unavailable.
-    func update(cpuTemp: Double?, batteryTemp: Double?) {
-        // Format menubar title
+    /// Update the menubar title and dropdown with current readings.
+    func update(cpuTemp: Double?, batteryTemp: Double?, freq: FrequencyReader.ClusterFrequency?) {
         let cpuStr = cpuTemp.map { formatTemp($0) } ?? "N/A"
         let batStr = batteryTemp.map { formatTemp($0) } ?? "N/A"
+        let pGHz = freq?.pClusterGHz ?? "--"
+        let eGHz = freq?.eClusterGHz ?? "--"
 
-        let title = "CPU: \(cpuStr) | Bat: \(batStr)"
+        let title = "CPU: \(cpuStr) P:\(pGHz) E:\(eGHz) | Bat: \(batStr)"
 
-        // Determine worst-case color for the menubar text
         let color = worstColor(cpuTemp: cpuTemp, batteryTemp: batteryTemp)
-
         let attrs: [NSAttributedString.Key: Any] = [
             .foregroundColor: color,
             .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
@@ -360,6 +586,8 @@ final class MenuBarController {
 
         // Update dropdown menu items
         cpuMenuItem.title = "CPU Temperature:  \(cpuStr)"
+        pFreqMenuItem.title = "P-Cluster Frequency:  \(pGHz) GHz"
+        eFreqMenuItem.title = "E-Cluster Frequency:  \(eGHz) GHz"
         batteryMenuItem.title = "Battery Temperature:  \(batStr)"
 
         let status = overallStatus(cpuTemp: cpuTemp, batteryTemp: batteryTemp)
@@ -420,6 +648,7 @@ final class MenuBarController {
 /// Sets up a 3-second repeating timer to refresh temperature readings.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var reader: TemperatureReader?
+    private var freqReader: FrequencyReader?
     private var menuBar: MenuBarController?
     private var refreshTimer: Timer?
 
@@ -436,37 +665,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let tempReader = TemperatureReader(smc: smc)
         reader = tempReader
 
+        // FrequencyReader is optional — app works without it (shows "--" for freq)
+        freqReader = FrequencyReader()
+        if freqReader == nil {
+            NSLog("TempMonitor: FrequencyReader unavailable — frequencies will show as --")
+        }
+
         let mb = MenuBarController()
         menuBar = mb
 
         // Initial reading
-        refreshTemperatures()
+        refreshReadings()
 
         // Schedule repeating timer — weak self to prevent retain cycle
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
-            self?.refreshTemperatures()
+            self?.refreshReadings()
         }
         // Ensure timer fires during UI tracking (e.g., when menu is open)
         if let timer = refreshTimer {
             RunLoop.current.add(timer, forMode: .common)
         }
 
-        NSLog("TempMonitor: Started — CPU key: %@, Battery key: %@",
+        NSLog("TempMonitor: Started — CPU key: %@, Battery key: %@, Freq: %@",
               tempReader.cpuKey ?? "none",
-              tempReader.batteryKey ?? "none")
+              tempReader.batteryKey ?? "none",
+              freqReader != nil ? "yes" : "no")
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         refreshTimer?.invalidate()
         refreshTimer = nil
-        // reader and its SMCClient will be deallocated, closing the IOKit connection via deinit
     }
 
-    private func refreshTemperatures() {
+    private func refreshReadings() {
         guard let reader = reader, let menuBar = menuBar else { return }
         let cpuTemp = reader.readCPUTemp()
         let batteryTemp = reader.readBatteryTemp()
-        menuBar.update(cpuTemp: cpuTemp, batteryTemp: batteryTemp)
+        let freq = freqReader?.sample()
+        menuBar.update(cpuTemp: cpuTemp, batteryTemp: batteryTemp, freq: freq)
     }
 }
 
