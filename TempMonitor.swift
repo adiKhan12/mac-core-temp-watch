@@ -222,3 +222,68 @@ final class SMCClient {
         )
     }
 }
+
+// MARK: - TemperatureReader
+
+/// Wraps SMCClient to read CPU and battery temperatures.
+/// Probes for available sensor keys at startup since keys vary by Mac model.
+final class TemperatureReader {
+    private let smc: SMCClient
+
+    /// The SMC key that was found to work for CPU temperature, or nil if none found.
+    private(set) var cpuKey: String?
+    /// The SMC key that was found to work for battery temperature, or nil if none found.
+    private(set) var batteryKey: String?
+
+    /// CPU temperature keys to probe, in priority order.
+    /// Different Mac models expose different keys.
+    private static let cpuKeyProbeList: [String] = [
+        "TC0P",  // CPU proximity (Intel + some Apple Silicon)
+        "Tp09",  // CPU efficiency core temp (Apple Silicon)
+        "Tp01",  // CPU performance core temp (Apple Silicon)
+        "Tp05",  // CPU performance core 2 (Apple Silicon)
+        "Tp0D",  // CPU die temp (Apple Silicon)
+        "TC0E",  // CPU package (Intel)
+        "TC0D",  // CPU die (Intel)
+    ]
+
+    /// Battery temperature keys to probe, in priority order.
+    private static let batteryKeyProbeList: [String] = [
+        "TB0T",  // Battery sensor 0
+        "TB1T",  // Battery sensor 1
+        "TB2T",  // Battery sensor 2
+    ]
+
+    init(smc: SMCClient) {
+        self.smc = smc
+        probeKeys()
+    }
+
+    /// Try each candidate key and keep the first one that returns a valid reading.
+    private func probeKeys() {
+        for key in Self.cpuKeyProbeList {
+            if smc.readTemperature(key: key) != nil {
+                cpuKey = key
+                break
+            }
+        }
+        for key in Self.batteryKeyProbeList {
+            if smc.readTemperature(key: key) != nil {
+                batteryKey = key
+                break
+            }
+        }
+    }
+
+    /// Read the current CPU temperature in Celsius, or nil if unavailable.
+    func readCPUTemp() -> Double? {
+        guard let key = cpuKey else { return nil }
+        return smc.readTemperature(key: key)
+    }
+
+    /// Read the current battery temperature in Celsius, or nil if unavailable.
+    func readBatteryTemp() -> Double? {
+        guard let key = batteryKey else { return nil }
+        return smc.readTemperature(key: key)
+    }
+}
