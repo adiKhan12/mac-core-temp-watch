@@ -575,7 +575,8 @@ final class MenuBarController {
         let pGHz = freq?.pClusterGHz ?? "--"
         let eGHz = freq?.eClusterGHz ?? "--"
 
-        let title = "CPU: \(cpuStr) P:\(pGHz) E:\(eGHz) | Bat: \(batStr)"
+        // Menubar: show P-core freq only (the one users care about)
+        let title = "CPU: \(cpuStr) \(pGHz)GHz | Bat: \(batStr)"
 
         let color = worstColor(cpuTemp: cpuTemp, batteryTemp: batteryTemp)
         let attrs: [NSAttributedString.Key: Any] = [
@@ -652,6 +653,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var menuBar: MenuBarController?
     private var refreshTimer: Timer?
 
+    /// Sampling runs on a utility-QoS queue so macOS schedules it on E-cores,
+    /// keeping the app's CPU impact minimal and battery-friendly.
+    private let samplingQueue = DispatchQueue(label: "com.tempmonitor.sampling", qos: .utility)
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         let smc = SMCClient()
         guard smc.open() else {
@@ -699,10 +704,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func refreshReadings() {
         guard let reader = reader, let menuBar = menuBar else { return }
-        let cpuTemp = reader.readCPUTemp()
-        let batteryTemp = reader.readBatteryTemp()
-        let freq = freqReader?.sample()
-        menuBar.update(cpuTemp: cpuTemp, batteryTemp: batteryTemp, freq: freq)
+
+        // Offload SMC reads and IOReport sampling to utility QoS (E-core preferred)
+        samplingQueue.async { [weak self] in
+            let cpuTemp = reader.readCPUTemp()
+            let batteryTemp = reader.readBatteryTemp()
+            let freq = self?.freqReader?.sample()
+
+            // UI updates must happen on the main thread
+            DispatchQueue.main.async {
+                menuBar.update(cpuTemp: cpuTemp, batteryTemp: batteryTemp, freq: freq)
+            }
+        }
     }
 }
 
