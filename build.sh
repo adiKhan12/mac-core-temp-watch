@@ -1,6 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
 APP_NAME="TempMonitor"
 BUNDLE_DIR="build/${APP_NAME}.app"
 DMG_NAME="${APP_NAME}.dmg"
@@ -36,7 +39,7 @@ codesign --verify --verbose "${BUNDLE_DIR}" 2>&1 | head -1
 
 # Step 4: Create DMG
 echo "[4/4] Creating DMG..."
-rm -f "${DMG_NAME}"
+rm -f "${BUILD_DIR}/${DMG_NAME}"
 hdiutil create \
     -volname "${APP_NAME}" \
     -srcfolder "${BUNDLE_DIR}" \

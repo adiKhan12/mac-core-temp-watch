@@ -68,6 +68,7 @@ struct SMCKeyData {
     var vers: SMCKeyDataVersion = SMCKeyDataVersion()
     var pLimitData: SMCKeyDataPLimitData = SMCKeyDataPLimitData()
     var keyInfo: SMCKeyDataKeyInfo = SMCKeyDataKeyInfo()
+    var padding: UInt16 = 0
     var result: UInt8 = 0
     var status: UInt8 = 0
     var data8: UInt8 = 0
@@ -80,7 +81,7 @@ struct SMCKeyData {
 
 /// Safely convert an SMCBytes tuple to a [UInt8] array of the given size.
 func smcBytesToArray(_ bytes: SMCBytes, size: Int) -> [UInt8] {
-    precondition(size >= 0 && size <= 32, "SMC data size must be 0-32")
+    guard size >= 0, size <= 32 else { return [] }
     var bytes = bytes
     return withUnsafeBytes(of: &bytes) { buffer in
         Array(buffer.prefix(size))
@@ -96,13 +97,24 @@ func convertSMCTemp(bytes: SMCBytes, dataType: UInt32, dataSize: UInt32) -> Doub
     let value: Double
     switch typeStr {
     case "flt ":
-        // IEEE 754 float, big-endian (common on Apple Silicon)
+        // IEEE 754 float — little-endian on Apple Silicon, big-endian on Intel
         guard byteArray.count >= 4 else { return nil }
-        let raw = UInt32(byteArray[0]) << 24
-                | UInt32(byteArray[1]) << 16
-                | UInt32(byteArray[2]) << 8
-                | UInt32(byteArray[3])
-        value = Double(Float(bitPattern: raw))
+        // Try little-endian first (Apple Silicon native byte order)
+        let rawLE = UInt32(byteArray[0])
+                  | UInt32(byteArray[1]) << 8
+                  | UInt32(byteArray[2]) << 16
+                  | UInt32(byteArray[3]) << 24
+        let floatLE = Float(bitPattern: rawLE)
+        if floatLE > -20 && floatLE < 150 {
+            value = Double(floatLE)
+        } else {
+            // Fallback to big-endian (Intel Macs)
+            let rawBE = UInt32(byteArray[0]) << 24
+                      | UInt32(byteArray[1]) << 16
+                      | UInt32(byteArray[2]) << 8
+                      | UInt32(byteArray[3])
+            value = Double(Float(bitPattern: rawBE))
+        }
     case "sp78":
         // Signed 8.8 fixed-point, big-endian
         guard byteArray.count >= 2 else { return nil }
@@ -184,8 +196,8 @@ final class SMCClient {
         inputData.data8 = kSMCGetKeyInfo
 
         var outputData = SMCKeyData()
-        let inputSize = MemoryLayout<SMCKeyData>.size
-        var outputSize = MemoryLayout<SMCKeyData>.size
+        let inputSize = MemoryLayout<SMCKeyData>.stride
+        var outputSize = MemoryLayout<SMCKeyData>.stride
 
         var kr = IOConnectCallStructMethod(
             connection,
@@ -204,7 +216,7 @@ final class SMCClient {
         inputData.keyInfo = keyInfo
 
         outputData = SMCKeyData()
-        outputSize = MemoryLayout<SMCKeyData>.size
+        outputSize = MemoryLayout<SMCKeyData>.stride
 
         kr = IOConnectCallStructMethod(
             connection,
@@ -238,20 +250,22 @@ final class TemperatureReader {
     /// CPU temperature keys to probe, in priority order.
     /// Different Mac models expose different keys.
     private static let cpuKeyProbeList: [String] = [
-        "TC0P",  // CPU proximity (Intel + some Apple Silicon)
-        "Tp09",  // CPU efficiency core temp (Apple Silicon)
-        "Tp01",  // CPU performance core temp (Apple Silicon)
-        "Tp05",  // CPU performance core 2 (Apple Silicon)
-        "Tp0D",  // CPU die temp (Apple Silicon)
-        "TC0E",  // CPU package (Intel)
-        "TC0D",  // CPU die (Intel)
+        // Apple Silicon (M1/M2/M3/M4) — performance cores
+        "Tp01", "Tp05", "Tp09", "Tp0D",
+        // Apple Silicon — efficiency cores
+        "Tp0T", "Tp0X", "Tp0b", "Tp0f", "Tp0j", "Tp0n",
+        "Tp0h", "Tp0L", "Tp0P", "Tp0S",
+        // M2/M3 additional
+        "Tp1h", "Tp1t", "Tp1p", "Tp1l",
+        // Intel — CPU proximity / die
+        "TC0P", "TC0D", "TC0E", "TC0F",
     ]
 
     /// Battery temperature keys to probe, in priority order.
     private static let batteryKeyProbeList: [String] = [
-        "TB0T",  // Battery sensor 0
-        "TB1T",  // Battery sensor 1
+        "TB1T",  // Battery sensor 1 (Apple Silicon primary)
         "TB2T",  // Battery sensor 2
+        "TB0T",  // Battery sensor 0 (Intel primary)
     ]
 
     init(smc: SMCClient) {

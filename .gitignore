@@ -1,0 +1,6 @@
+# Build artifacts
+build/
+TempMonitor
+*.dmg
+*.o
+*.dSYM/
