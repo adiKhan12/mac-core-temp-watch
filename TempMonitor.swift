@@ -287,3 +287,115 @@ final class TemperatureReader {
         return smc.readTemperature(key: key)
     }
 }
+
+// MARK: - MenuBarController
+
+/// Manages the NSStatusItem in the menu bar and its dropdown menu.
+final class MenuBarController {
+    private let statusItem: NSStatusItem
+    private let menu: NSMenu
+
+    // Menu item references for updating text
+    private let cpuMenuItem: NSMenuItem
+    private let batteryMenuItem: NSMenuItem
+    private let statusMenuItem: NSMenuItem
+
+    init() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        menu = NSMenu()
+
+        cpuMenuItem = NSMenuItem(title: "CPU Temperature:  --", action: nil, keyEquivalent: "")
+        cpuMenuItem.isEnabled = false
+        menu.addItem(cpuMenuItem)
+
+        batteryMenuItem = NSMenuItem(title: "Battery Temperature:  --", action: nil, keyEquivalent: "")
+        batteryMenuItem.isEnabled = false
+        menu.addItem(batteryMenuItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        statusMenuItem = NSMenuItem(title: "Status: Starting...", action: nil, keyEquivalent: "")
+        statusMenuItem.isEnabled = false
+        menu.addItem(statusMenuItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let quitItem = NSMenuItem(title: "Quit TempMonitor", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(quitItem)
+
+        statusItem.menu = menu
+    }
+
+    /// Update the menubar title and dropdown with current temperatures.
+    /// Pass nil for a sensor that is unavailable.
+    func update(cpuTemp: Double?, batteryTemp: Double?) {
+        // Format menubar title
+        let cpuStr = cpuTemp.map { formatTemp($0) } ?? "N/A"
+        let batStr = batteryTemp.map { formatTemp($0) } ?? "N/A"
+
+        let title = "CPU: \(cpuStr) | Bat: \(batStr)"
+
+        // Determine worst-case color for the menubar text
+        let color = worstColor(cpuTemp: cpuTemp, batteryTemp: batteryTemp)
+
+        let attrs: [NSAttributedString.Key: Any] = [
+            .foregroundColor: color,
+            .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
+        ]
+        statusItem.button?.attributedTitle = NSAttributedString(string: title, attributes: attrs)
+
+        // Update dropdown menu items
+        cpuMenuItem.title = "CPU Temperature:  \(cpuStr)"
+        batteryMenuItem.title = "Battery Temperature:  \(batStr)"
+
+        let status = overallStatus(cpuTemp: cpuTemp, batteryTemp: batteryTemp)
+        statusMenuItem.title = "Status: \(status)"
+    }
+
+    /// Show an error state in the menubar.
+    func showError(_ message: String) {
+        let attrs: [NSAttributedString.Key: Any] = [
+            .foregroundColor: NSColor.systemRed,
+            .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
+        ]
+        statusItem.button?.attributedTitle = NSAttributedString(string: message, attributes: attrs)
+        statusMenuItem.title = "Status: Error"
+    }
+
+    // MARK: - Private helpers
+
+    private func formatTemp(_ temp: Double) -> String {
+        return String(format: "%.0f°C", temp)
+    }
+
+    private func cpuColor(_ temp: Double?) -> NSColor {
+        guard let t = temp else { return .labelColor }
+        if t < 60 { return .systemGreen }
+        if t < 80 { return .systemOrange }
+        return .systemRed
+    }
+
+    private func batteryColor(_ temp: Double?) -> NSColor {
+        guard let t = temp else { return .labelColor }
+        if t < 35 { return .systemGreen }
+        if t < 40 { return .systemOrange }
+        return .systemRed
+    }
+
+    /// Return the most severe color between CPU and battery.
+    private func worstColor(cpuTemp: Double?, batteryTemp: Double?) -> NSColor {
+        let colors = [cpuColor(cpuTemp), batteryColor(batteryTemp)]
+        if colors.contains(.systemRed) { return .systemRed }
+        if colors.contains(.systemOrange) { return .systemOrange }
+        if colors.contains(.systemGreen) { return .systemGreen }
+        return .labelColor
+    }
+
+    private func overallStatus(cpuTemp: Double?, batteryTemp: Double?) -> String {
+        let color = worstColor(cpuTemp: cpuTemp, batteryTemp: batteryTemp)
+        if color == .systemRed { return "Hot" }
+        if color == .systemOrange { return "Warm" }
+        if color == .systemGreen { return "Normal" }
+        return "Unknown"
+    }
+}
