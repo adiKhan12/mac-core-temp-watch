@@ -135,3 +135,90 @@ func convertSMCTemp(bytes: SMCBytes, dataType: UInt32, dataSize: UInt32) -> Doub
     guard value > -20.0 && value < 150.0 else { return nil }
     return value
 }
+
+// MARK: - SMCClient
+
+/// Communicates with the AppleSMC IOService to read sensor values.
+/// Manages the IOKit connection lifecycle — opens on init, closes on deinit.
+final class SMCClient {
+    private var connection: io_connect_t = 0
+    private(set) var isOpen: Bool = false
+
+    /// Open a connection to the AppleSMC IOService.
+    /// Returns true on success, false if the SMC service is unavailable.
+    func open() -> Bool {
+        let matchingDict = IOServiceMatching("AppleSMC")
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, matchingDict)
+        guard service != IO_OBJECT_NULL else {
+            return false
+        }
+        let result = IOServiceOpen(service, mach_task_self_, 0, &connection)
+        IOObjectRelease(service)
+        isOpen = (result == kIOReturnSuccess)
+        return isOpen
+    }
+
+    /// Close the SMC connection and release resources.
+    func close() {
+        guard isOpen else { return }
+        IOServiceClose(connection)
+        connection = 0
+        isOpen = false
+    }
+
+    deinit {
+        close()
+    }
+
+    /// Read a temperature value for the given 4-character SMC key.
+    /// Returns the temperature in Celsius, or nil if the key doesn't exist or can't be read.
+    func readTemperature(key: String) -> Double? {
+        guard isOpen else { return nil }
+        guard key.utf8.count == 4 else { return nil }
+
+        let keyCode = fourCharCode(key)
+
+        // Step 1: Get key info (data type and size)
+        var inputData = SMCKeyData()
+        inputData.key = keyCode
+        inputData.data8 = kSMCGetKeyInfo
+
+        var outputData = SMCKeyData()
+        let inputSize = MemoryLayout<SMCKeyData>.size
+        var outputSize = MemoryLayout<SMCKeyData>.size
+
+        var kr = IOConnectCallStructMethod(
+            connection,
+            kSMCHandleYPCEvent,
+            &inputData, inputSize,
+            &outputData, &outputSize
+        )
+        guard kr == kIOReturnSuccess else { return nil }
+
+        let keyInfo = outputData.keyInfo
+
+        // Step 2: Read the key value using the info from step 1
+        inputData = SMCKeyData()
+        inputData.key = keyCode
+        inputData.data8 = kSMCReadKey
+        inputData.keyInfo = keyInfo
+
+        outputData = SMCKeyData()
+        outputSize = MemoryLayout<SMCKeyData>.size
+
+        kr = IOConnectCallStructMethod(
+            connection,
+            kSMCHandleYPCEvent,
+            &inputData, inputSize,
+            &outputData, &outputSize
+        )
+        guard kr == kIOReturnSuccess else { return nil }
+
+        // Step 3: Convert raw bytes to temperature
+        return convertSMCTemp(
+            bytes: outputData.bytes,
+            dataType: keyInfo.dataType,
+            dataSize: keyInfo.dataSize
+        )
+    }
+}
