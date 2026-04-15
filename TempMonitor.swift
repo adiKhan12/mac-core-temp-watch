@@ -719,6 +719,9 @@ final class MenuBarController {
         boostDetailItem.isHidden = true
         menu.addItem(boostDetailItem)
 
+        // Set target after all properties initialized (Swift requirement)
+        boostMenuItem.target = self
+
         menu.addItem(NSMenuItem.separator())
 
         let quitItem = NSMenuItem(title: "Quit TempMonitor", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -766,11 +769,6 @@ final class MenuBarController {
             boostMenuItem.title = "Enable Boost"
             boostDetailItem.isHidden = true
         }
-    }
-
-    /// Set the target for boost menu item actions.
-    func setBoostTarget(_ target: AnyObject) {
-        boostMenuItem.target = target
     }
 
     /// Show an error state in the menubar.
@@ -855,7 +853,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         thermalMonitor = ThermalMonitor()
 
         let mb = MenuBarController()
-        mb.setBoostTarget(self)
         mb.onBoostToggle = { [weak self] in self?.toggleBoost() }
         menuBar = mb
 
