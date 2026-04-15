@@ -242,12 +242,13 @@ final class SMCClient {
 final class TemperatureReader {
     private let smc: SMCClient
 
-    /// The SMC key that was found to work for CPU temperature, or nil if none found.
-    private(set) var cpuKey: String?
+    /// All CPU temperature keys that returned valid readings during probing.
+    /// Reading all cores and taking the max gives stable, accurate results.
+    private(set) var cpuKeys: [String] = []
     /// The SMC key that was found to work for battery temperature, or nil if none found.
     private(set) var batteryKey: String?
 
-    /// CPU temperature keys to probe, in priority order.
+    /// CPU temperature keys to probe.
     /// Different Mac models expose different keys.
     private static let cpuKeyProbeList: [String] = [
         // Apple Silicon (M1/M2/M3/M4) — performance cores
@@ -273,12 +274,11 @@ final class TemperatureReader {
         probeKeys()
     }
 
-    /// Try each candidate key and keep the first one that returns a valid reading.
+    /// Find all valid CPU keys and the first valid battery key.
     private func probeKeys() {
         for key in Self.cpuKeyProbeList {
             if smc.readTemperature(key: key) != nil {
-                cpuKey = key
-                break
+                cpuKeys.append(key)
             }
         }
         for key in Self.batteryKeyProbeList {
@@ -289,10 +289,16 @@ final class TemperatureReader {
         }
     }
 
-    /// Read the current CPU temperature in Celsius, or nil if unavailable.
+    /// Read the current CPU temperature as the MAX across all detected cores.
+    /// This matches how professional monitoring tools report CPU temp.
     func readCPUTemp() -> Double? {
-        guard let key = cpuKey else { return nil }
-        return smc.readTemperature(key: key)
+        var maxTemp: Double? = nil
+        for key in cpuKeys {
+            if let t = smc.readTemperature(key: key) {
+                if maxTemp == nil || t > maxTemp! { maxTemp = t }
+            }
+        }
+        return maxTemp
     }
 
     /// Read the current battery temperature in Celsius, or nil if unavailable.
@@ -464,7 +470,9 @@ final class FrequencyReader {
                 let ns = stateGetResidency(item, Int32(s))
                 guard ns > 0 else { continue }
                 if let idx = FrequencyReader.parseDVFSIndex(from: sn), idx < freqTable.count {
-                    let mhz = Double(freqTable[idx]) / 1_000_000.0
+                    // DVFS state names use descending index: P0 = highest freq, P19 = lowest
+                    let reversedIdx = freqTable.count - 1 - idx
+                    let mhz = Double(freqTable[reversedIdx]) / 1_000_000.0
                     coreWeighted += Double(ns) * mhz
                     coreNs += ns
                 }
@@ -691,8 +699,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             RunLoop.current.add(timer, forMode: .common)
         }
 
-        NSLog("TempMonitor: Started — CPU key: %@, Battery key: %@, Freq: %@",
-              tempReader.cpuKey ?? "none",
+        NSLog("TempMonitor: Started — CPU keys: %d, Battery key: %@, Freq: %@",
+              tempReader.cpuKeys.count,
               tempReader.batteryKey ?? "none",
               freqReader != nil ? "yes" : "no")
     }
