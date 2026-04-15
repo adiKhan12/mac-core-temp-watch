@@ -1,5 +1,6 @@
 import Cocoa
 import IOKit
+import IOKit.pwr_mgt
 
 // MARK: - SMC Types & Constants
 
@@ -528,6 +529,136 @@ final class FrequencyReader {
     }
 }
 
+// MARK: - Thermal Pressure Monitor
+
+/// Reads macOS thermal pressure level via the Darwin notify API.
+/// Uses dlsym to access notify_register_check/notify_get_state from libSystem.
+final class ThermalMonitor {
+    enum ThermalLevel: Int {
+        case nominal = 0, moderate = 1, heavy = 2, trapping = 3, sleeping = 4
+        var label: String {
+            switch self {
+            case .nominal: return "Nominal"
+            case .moderate: return "Moderate"
+            case .heavy: return "Heavy"
+            case .trapping: return "Critical"
+            case .sleeping: return "Sleeping"
+            }
+        }
+    }
+
+    private typealias NotifyRegCheckFn = @convention(c) (UnsafePointer<CChar>, UnsafeMutablePointer<Int32>) -> UInt32
+    private typealias NotifyGetStateFn = @convention(c) (Int32, UnsafeMutablePointer<UInt64>) -> UInt32
+    private typealias NotifyCancelFn = @convention(c) (Int32) -> UInt32
+
+    private let notifyRegisterCheck: NotifyRegCheckFn
+    private let notifyGetState: NotifyGetStateFn
+    private let notifyCancel: NotifyCancelFn
+    private var token: Int32 = 0
+    private var registered = false
+
+    init?() {
+        let RTLD_DEFAULT = UnsafeMutableRawPointer(bitPattern: -2)
+        guard let fn1 = dlsym(RTLD_DEFAULT, "notify_register_check"),
+              let fn2 = dlsym(RTLD_DEFAULT, "notify_get_state"),
+              let fn3 = dlsym(RTLD_DEFAULT, "notify_cancel") else {
+            return nil
+        }
+        notifyRegisterCheck = unsafeBitCast(fn1, to: NotifyRegCheckFn.self)
+        notifyGetState = unsafeBitCast(fn2, to: NotifyGetStateFn.self)
+        notifyCancel = unsafeBitCast(fn3, to: NotifyCancelFn.self)
+
+        let status = notifyRegisterCheck("com.apple.system.thermalpressurelevel", &token)
+        guard status == 0 else { return nil }  // NOTIFY_STATUS_OK = 0
+        registered = true
+    }
+
+    deinit {
+        if registered { _ = notifyCancel(token) }
+    }
+
+    func currentLevel() -> ThermalLevel {
+        var state: UInt64 = 0
+        _ = notifyGetState(token, &state)
+        return ThermalLevel(rawValue: Int(state)) ?? .nominal
+    }
+}
+
+// MARK: - Boost Manager
+
+/// Manages "Boost Mode" — silences background CPU consumers to maximize
+/// thermal budget for the user's foreground work.
+/// Actions: memory purge, Spotlight pause, Time Machine pause, power assertion.
+final class BoostManager {
+    private(set) var isActive = false
+    private var powerAssertionID: IOPMAssertionID = 0
+
+    /// Enable boost mode. Shows a macOS admin password prompt for privileged commands.
+    /// Returns true if boost was successfully enabled.
+    func enable() -> Bool {
+        guard !isActive else { return true }
+
+        // Batch all privileged commands into a single admin prompt
+        let commands = [
+            "/usr/sbin/purge",
+            "/usr/bin/mdutil -a -i off",
+            "/usr/bin/tmutil stopbackup 2>/dev/null || true"
+        ].joined(separator: "; ")
+
+        guard runPrivileged(commands) else {
+            NSLog("BoostManager: Failed to run privileged commands (user cancelled?)")
+            return false
+        }
+
+        // Power assertion — no root needed
+        let result = IOPMAssertionCreateWithName(
+            kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            "TempMonitor Boost Mode" as CFString,
+            &powerAssertionID
+        )
+        if result != kIOReturnSuccess {
+            NSLog("BoostManager: Power assertion failed: \(result)")
+        }
+
+        isActive = true
+        NSLog("BoostManager: Boost enabled — memory purged, Spotlight paused, power hold active")
+        return true
+    }
+
+    /// Disable boost mode and restore system to normal.
+    func disable() {
+        guard isActive else { return }
+
+        // Release power assertion
+        if powerAssertionID != 0 {
+            IOPMAssertionRelease(powerAssertionID)
+            powerAssertionID = 0
+        }
+
+        // Restore Spotlight (needs admin)
+        let commands = "/usr/bin/mdutil -a -i on"
+        if !runPrivileged(commands) {
+            NSLog("BoostManager: Failed to re-enable Spotlight (user cancelled?)")
+        }
+
+        isActive = false
+        NSLog("BoostManager: Boost disabled — Spotlight resumed")
+    }
+
+    /// Run a shell command with admin privileges via native macOS auth dialog.
+    private func runPrivileged(_ command: String) -> Bool {
+        // Escape for AppleScript string
+        let escaped = command.replacingOccurrences(of: "\\", with: "\\\\")
+                             .replacingOccurrences(of: "\"", with: "\\\"")
+        let source = "do shell script \"\(escaped)\" with administrator privileges"
+        guard let script = NSAppleScript(source: source) else { return false }
+        var error: NSDictionary?
+        script.executeAndReturnError(&error)
+        return error == nil
+    }
+}
+
 // MARK: - MenuBarController
 
 /// Manages the NSStatusItem in the menu bar and its dropdown menu.
@@ -540,7 +671,13 @@ final class MenuBarController {
     private let pFreqMenuItem: NSMenuItem
     private let eFreqMenuItem: NSMenuItem
     private let batteryMenuItem: NSMenuItem
+    private let thermalMenuItem: NSMenuItem
     private let statusMenuItem: NSMenuItem
+    private let boostMenuItem: NSMenuItem
+    private let boostDetailItem: NSMenuItem
+
+    /// Called when user clicks the boost toggle.
+    var onBoostToggle: (() -> Void)?
 
     init() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -562,11 +699,25 @@ final class MenuBarController {
         batteryMenuItem.isEnabled = false
         menu.addItem(batteryMenuItem)
 
+        thermalMenuItem = NSMenuItem(title: "Thermal: --", action: nil, keyEquivalent: "")
+        thermalMenuItem.isEnabled = false
+        menu.addItem(thermalMenuItem)
+
         menu.addItem(NSMenuItem.separator())
 
         statusMenuItem = NSMenuItem(title: "Status: Starting...", action: nil, keyEquivalent: "")
         statusMenuItem.isEnabled = false
         menu.addItem(statusMenuItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        boostMenuItem = NSMenuItem(title: "Enable Boost", action: #selector(boostClicked), keyEquivalent: "b")
+        menu.addItem(boostMenuItem)
+
+        boostDetailItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        boostDetailItem.isEnabled = false
+        boostDetailItem.isHidden = true
+        menu.addItem(boostDetailItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -577,14 +728,17 @@ final class MenuBarController {
     }
 
     /// Update the menubar title and dropdown with current readings.
-    func update(cpuTemp: Double?, batteryTemp: Double?, freq: FrequencyReader.ClusterFrequency?) {
+    func update(cpuTemp: Double?, batteryTemp: Double?, freq: FrequencyReader.ClusterFrequency?,
+                thermal: ThermalMonitor.ThermalLevel?, boosted: Bool) {
         let cpuStr = cpuTemp.map { formatTemp($0) } ?? "N/A"
         let batStr = batteryTemp.map { formatTemp($0) } ?? "N/A"
         let pGHz = freq?.pClusterGHz ?? "--"
         let eGHz = freq?.eClusterGHz ?? "--"
+        let thermalStr = thermal?.label ?? "--"
 
-        // Menubar: show P-core freq only (the one users care about)
-        let title = "CPU: \(cpuStr) \(pGHz)GHz | Bat: \(batStr)"
+        // Menubar title — show boost indicator when active
+        let boostPrefix = boosted ? "\u{26A1} " : ""
+        let title = "\(boostPrefix)CPU: \(cpuStr) \(pGHz)GHz | Bat: \(batStr)"
 
         let color = worstColor(cpuTemp: cpuTemp, batteryTemp: batteryTemp)
         let attrs: [NSAttributedString.Key: Any] = [
@@ -598,9 +752,25 @@ final class MenuBarController {
         pFreqMenuItem.title = "P-Cluster Frequency:  \(pGHz) GHz"
         eFreqMenuItem.title = "E-Cluster Frequency:  \(eGHz) GHz"
         batteryMenuItem.title = "Battery Temperature:  \(batStr)"
+        thermalMenuItem.title = "Thermal: \(thermalStr)"
 
         let status = overallStatus(cpuTemp: cpuTemp, batteryTemp: batteryTemp)
         statusMenuItem.title = "Status: \(status)"
+
+        // Boost UI
+        if boosted {
+            boostMenuItem.title = "Disable Boost"
+            boostDetailItem.title = "  Spotlight: Paused | Memory: Purged"
+            boostDetailItem.isHidden = false
+        } else {
+            boostMenuItem.title = "Enable Boost"
+            boostDetailItem.isHidden = true
+        }
+    }
+
+    /// Set the target for boost menu item actions.
+    func setBoostTarget(_ target: AnyObject) {
+        boostMenuItem.target = target
     }
 
     /// Show an error state in the menubar.
@@ -614,6 +784,10 @@ final class MenuBarController {
     }
 
     // MARK: - Private helpers
+
+    @objc private func boostClicked() {
+        onBoostToggle?()
+    }
 
     private func formatTemp(_ temp: Double) -> String {
         return String(format: "%.0f°C", temp)
@@ -633,7 +807,6 @@ final class MenuBarController {
         return .systemRed
     }
 
-    /// Return the most severe color between CPU and battery.
     private func worstColor(cpuTemp: Double?, batteryTemp: Double?) -> NSColor {
         let colors = [cpuColor(cpuTemp), batteryColor(batteryTemp)]
         if colors.contains(.systemRed) { return .systemRed }
@@ -658,11 +831,12 @@ final class MenuBarController {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var reader: TemperatureReader?
     private var freqReader: FrequencyReader?
+    private var thermalMonitor: ThermalMonitor?
+    private let boostManager = BoostManager()
     private var menuBar: MenuBarController?
     private var refreshTimer: Timer?
 
-    /// Sampling runs on a utility-QoS queue so macOS schedules it on E-cores,
-    /// keeping the app's CPU impact minimal and battery-friendly.
+    /// Sampling runs on a utility-QoS queue so macOS schedules it on E-cores.
     private let samplingQueue = DispatchQueue(label: "com.tempmonitor.sampling", qos: .utility)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -677,51 +851,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let tempReader = TemperatureReader(smc: smc)
         reader = tempReader
-
-        // FrequencyReader is optional — app works without it (shows "--" for freq)
         freqReader = FrequencyReader()
-        if freqReader == nil {
-            NSLog("TempMonitor: FrequencyReader unavailable — frequencies will show as --")
-        }
+        thermalMonitor = ThermalMonitor()
 
         let mb = MenuBarController()
+        mb.setBoostTarget(self)
+        mb.onBoostToggle = { [weak self] in self?.toggleBoost() }
         menuBar = mb
 
-        // Initial reading
         refreshReadings()
 
-        // Schedule repeating timer — weak self to prevent retain cycle
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
             self?.refreshReadings()
         }
-        // Ensure timer fires during UI tracking (e.g., when menu is open)
         if let timer = refreshTimer {
             RunLoop.current.add(timer, forMode: .common)
         }
 
-        NSLog("TempMonitor: Started — CPU keys: %d, Battery key: %@, Freq: %@",
+        NSLog("TempMonitor: Started — CPU keys: %d, Battery: %@, Freq: %@, Thermal: %@",
               tempReader.cpuKeys.count,
               tempReader.batteryKey ?? "none",
-              freqReader != nil ? "yes" : "no")
+              freqReader != nil ? "yes" : "no",
+              thermalMonitor != nil ? "yes" : "no")
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         refreshTimer?.invalidate()
         refreshTimer = nil
+        // Disable boost on quit to restore Spotlight
+        if boostManager.isActive { boostManager.disable() }
+    }
+
+    @objc private func toggleBoost() {
+        if boostManager.isActive {
+            boostManager.disable()
+        } else {
+            _ = boostManager.enable()
+        }
+        // Immediate UI refresh to show new boost state
+        refreshReadings()
     }
 
     private func refreshReadings() {
         guard let reader = reader, let menuBar = menuBar else { return }
+        let boosted = boostManager.isActive
+        let thermal = thermalMonitor?.currentLevel()
 
-        // Offload SMC reads and IOReport sampling to utility QoS (E-core preferred)
         samplingQueue.async { [weak self] in
             let cpuTemp = reader.readCPUTemp()
             let batteryTemp = reader.readBatteryTemp()
             let freq = self?.freqReader?.sample()
 
-            // UI updates must happen on the main thread
             DispatchQueue.main.async {
-                menuBar.update(cpuTemp: cpuTemp, batteryTemp: batteryTemp, freq: freq)
+                menuBar.update(cpuTemp: cpuTemp, batteryTemp: batteryTemp,
+                             freq: freq, thermal: thermal, boosted: boosted)
             }
         }
     }
